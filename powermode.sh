@@ -277,12 +277,20 @@ expand_cpu_range() {
     local range="$1"
     local parts expanded=()
 
+    if [[ -z "$range" ]]; then
+        return
+    fi
+
     IFS=',' read -ra parts <<< "$range"
     for part in "${parts[@]}"; do
         if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            for ((i = ${BASH_REMATCH[1]}; i <= ${BASH_REMATCH[2]}; i++)); do
-                expanded+=("$i")
-            done
+            local start=${BASH_REMATCH[1]}
+            local end=${BASH_REMATCH[2]}
+            if [[ $start -le $end ]]; then
+                for ((i = start; i <= end; i++)); do
+                    expanded+=("$i")
+                done
+            fi
         elif [[ "$part" =~ ^[0-9]+$ ]]; then
             expanded+=("$part")
         fi
@@ -303,40 +311,29 @@ detect_all_cpus() {
 
 detect_core_type() {
     local cpu=$1
-    local type_file="/sys/devices/system/cpu/cpu${cpu}/topology/core_type"
-    local cluster_file="/sys/devices/system/cpu/cpu${cpu}/topology/cluster_cpus_list"
-    local core_type=""
 
-    if [[ -f "$type_file" ]]; then
-        local val
-        val=$(cat "$type_file")
-        case "$val" in
-            0) core_type="P-core" ;;
-            1) core_type="E-core" ;;
-            *) core_type="Core" ;;
-        esac
-    fi
-
-    if [[ -z "$core_type" && -f "$cluster_file" ]]; then
-        local cpu_list
-        cpu_list=$(cat "$cluster_file" | tr -d ' ' | tr ',' '\n' | grep -oP 'cpu\K\d+')
-        if [[ "$cpu" == "$cpu_list" ]]; then
-            core_type="P-core"
-        else
-            core_type="E-core"
+    local siblings_file="/sys/devices/system/cpu/cpu${cpu}/topology/thread_siblings_list"
+    if [[ -f "$siblings_file" ]]; then
+        local siblings count
+        siblings=$(expand_cpu_range "$(tr -d ' ' < "$siblings_file")")
+        count=$(echo "$siblings" | wc -w)
+        if [[ $count -gt 1 ]]; then
+            echo "P-core"
+            return
         fi
     fi
 
-    if [[ -z "$core_type" ]]; then
-        local cpu_num=$cpu
-        case "$cpu_num" in
-            0|1|2|3) core_type="P-core" ;;
-            4|5|6|7|8|9|10|11) core_type="E-core" ;;
-            *) core_type="Core" ;;
+    local core_type_file="/sys/devices/system/cpu/cpu${cpu}/topology/core_type"
+    if [[ -f "$core_type_file" ]]; then
+        local val
+        val=$(cat "$core_type_file")
+        case "$val" in
+            1|0x20|32) echo "E-core"; return ;;
+            2|0x40|64) echo "P-core"; return ;;
         esac
     fi
 
-    echo "$core_type"
+    echo "E-core"
 }
 
 read_turbo() {
@@ -386,8 +383,9 @@ set_mode() {
             for i in $(detect_all_cpus); do
                 local type
                 type=$(detect_core_type "$i")
-                if [[ "$type" == "E-core" ]]; then
-                    echo 0 | sudo tee "/sys/devices/system/cpu/cpu${i}/online" > /dev/null
+                local online_file="/sys/devices/system/cpu/cpu${i}/online"
+                if [[ "$type" == "E-core" && -f "$online_file" ]]; then
+                    echo 0 | sudo tee "$online_file" > /dev/null
                 fi
             done
             apply_epp "power"
@@ -396,7 +394,8 @@ set_mode() {
         default)
             echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null
             for i in $(detect_all_cpus); do
-                echo 1 | sudo tee "/sys/devices/system/cpu/cpu${i}/online" > /dev/null
+                local online_file="/sys/devices/system/cpu/cpu${i}/online"
+                [[ -f "$online_file" ]] && echo 1 | sudo tee "$online_file" > /dev/null
             done
             apply_epp "balance_performance"
             sudo envycontrol -s hybrid
@@ -404,7 +403,8 @@ set_mode() {
         performance)
             echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null
             for i in $(detect_all_cpus); do
-                echo 1 | sudo tee "/sys/devices/system/cpu/cpu${i}/online" > /dev/null
+                local online_file="/sys/devices/system/cpu/cpu${i}/online"
+                [[ -f "$online_file" ]] && echo 1 | sudo tee "$online_file" > /dev/null
             done
             apply_epp "performance"
             sudo envycontrol -s nvidia
@@ -511,9 +511,9 @@ tui_echo() { printf '%b\n' "$*"; }
 tui_status_val() {
     local val=$1
     case "$val" in
-        Enabled|ONLINE|performance|nvidia) printf '%s' "${C_GREEN}${val}${C_RESET}" ;;
-        Disabled|OFFLINE|power|integrated) printf '%s' "${C_RED}${val}${C_RESET}" ;;
-        *)                                 printf '%s' "${C_YELLOW}${val}${C_RESET}" ;;
+        0|Enabled|ONLINE|performance|nvidia) printf '%s' "${C_GREEN}${val}${C_RESET}" ;;
+        1|Disabled|OFFLINE|power|integrated) printf '%s' "${C_RED}${val}${C_RESET}" ;;
+        *)                                   printf '%s' "${C_YELLOW}${val}${C_RESET}" ;;
     esac
 }
 
@@ -539,8 +539,8 @@ tui_err() {
 
 tui_header() {
     local turbo=$1; shift
-    local epp=$1; shift
     local gpu=$1; shift
+    local epp=$1; shift
     local cores=$1; shift
     local ncores=$1
 
@@ -586,6 +586,90 @@ tui_menu_option() {
     printf '  %s) %s\n' "${C_YELLOW}$1${C_RESET}" "$2"
 }
 
+# --- Hybrid CPU Specific ---
+
+tui_hybrid() {
+    tui_clear
+
+    local all_cpus
+    mapfile -t all_cpus < <(detect_all_cpus)
+
+    local p_cores=() e_cores=() other_cores=()
+    for cpu in "${all_cpus[@]}"; do
+        local label
+        label=$(detect_core_type "$cpu")
+        case "$label" in
+            P-core) p_cores+=("$cpu") ;;
+            E-core) e_cores+=("$cpu") ;;
+            *) other_cores+=("$cpu") ;;
+        esac
+    done
+
+    local turbo_val gpu_val epp_val cores_val
+    turbo_val=$(tui_status_val "$(read_turbo)")
+    gpu_val=$(read_gpu_mode | grep -oiP '(integrated|hybrid|nvidia)' | head -1)
+    epp_val=$(read_epp)
+    cores_val=$(cat /sys/devices/system/cpu/online 2>/dev/null || echo "N/A")
+    local ncores
+    ncores=$(detect_online_cpus | wc -w)
+    tui_header "$turbo_val" "$gpu_val" "$epp_val" "$cores_val" "$ncores"
+
+    tui_echo "${C_BOLD}Hybrid CPU Controls:${C_RESET}"
+    tui_echo ""
+    tui_echo "${C_DIM}P-cores (Performance):${C_RESET} ${p_cores[*]}"
+    tui_echo "${C_DIM}E-cores (Efficiency):${C_RESET} ${e_cores[*]}"
+    tui_echo ""
+
+    tui_menu_option "1" "Offline all E-cores (Power Saving)"
+    tui_menu_option "2" "Online all E-cores (Default/Performance)"
+    tui_menu_option "3" "Toggle all E-cores"
+    tui_menu_option "4" "Back to main menu"
+    tui_echo ""
+
+    local choice
+    choice=$(tui_read_choice 4)
+    tui_echo ""
+
+    case "$choice" in
+        1)
+            tui_echo "Offline all E-cores..."
+            for cpu in "${e_cores[@]}"; do
+                local online_file="/sys/devices/system/cpu/cpu${cpu}/online"
+                [[ -f "$online_file" ]] && echo 0 | sudo tee "$online_file" > /dev/null
+            done
+            tui_ok "All E-cores offline."
+            tui_wait
+            ;;
+        2)
+            tui_echo "Online all E-cores..."
+            for cpu in "${e_cores[@]}"; do
+                local online_file="/sys/devices/system/cpu/cpu${cpu}/online"
+                [[ -f "$online_file" ]] && echo 1 | sudo tee "$online_file" > /dev/null
+            done
+            tui_ok "All E-cores online."
+            tui_wait
+            ;;
+        3)
+            tui_echo "Toggle all E-cores..."
+            for cpu in "${e_cores[@]}"; do
+                local online_file="/sys/devices/system/cpu/cpu${cpu}/online"
+                [[ -f "$online_file" ]] || continue
+                local state
+                state=$(cat "$online_file")
+                if [[ "$state" == 1 ]]; then
+                    echo 0 | sudo tee "$online_file" > /dev/null
+                else
+                    echo 1 | sudo tee "$online_file" > /dev/null
+                fi
+            done
+            tui_ok "All E-cores toggled."
+            tui_wait
+            ;;
+        4) tui_mode ;;
+        *) tui_err "Invalid option" ; tui_wait ;;
+    esac
+}
+
 # -----------------------------------------------------------------------
 
 tui_mode() {
@@ -607,7 +691,7 @@ tui_mode() {
         cores_online=$(cat /sys/devices/system/cpu/online 2>/dev/null || echo "N/A")
         ncores=$(detect_online_cpus 2>/dev/null | wc -w)
 
-        tui_header "$turbo_state" "$epp_state" "$gpu_state" "$cores_online" "$ncores"
+        tui_header "$turbo_state" "$gpu_state" "$epp_state" "$cores_online" "$ncores"
 
         tui_menu_option "1" "Toggle Turbo Boost      [$(tui_status_val "$turbo_state")]"
         tui_menu_option "2" "Configure CPU Cores     [$(tui_status_val "$cores_online")]"
@@ -615,11 +699,12 @@ tui_mode() {
         tui_menu_option "4" "Set GPU Mode            [$(tui_status_val "${gpu_state:-unknown}")]"
         tui_menu_option "5" "Apply preset mode       (saving / default / performance)"
         tui_menu_option "6" "Save current as profile"
-        tui_menu_option "7" "Exit"
+        tui_menu_option "7" "Hybrid CPU Controls"
+        tui_menu_option "8" "Exit"
         tui_echo ""
 
         local choice
-        choice=$(tui_read_choice 7)
+        choice=$(tui_read_choice 8)
         tui_echo ""
 
         case "$choice" in
@@ -629,7 +714,8 @@ tui_mode() {
             4) tui_gpu ;;
             5) tui_apply_custom ;;
             6) tui_save_profile ;;
-            7) tui_clear; break ;;
+            7) tui_hybrid ;;
+            8) tui_clear; break ;;
             *) tui_err "Invalid option" ; tui_wait ;;
         esac
     done
@@ -679,6 +765,7 @@ tui_cores() {
     tui_echo "${C_BOLD}CPU Cores:${C_RESET}"
     tui_echo ""
 
+    local p_cores=() e_cores=() other_cores=()
     for cpu in "${all_cpus[@]}"; do
         local online_file="/sys/devices/system/cpu/cpu${cpu}/online"
         local label
@@ -692,8 +779,18 @@ tui_cores() {
             status_color=$C_RED
         fi
         printf '    CPU %-3s  %-8s  %s\n' "$cpu" "${status_color}${status_text}${C_RESET}" "${C_DIM}($label)${C_RESET}"
+
+        case "$label" in
+            P-core) p_cores+=("$cpu") ;;
+            E-core) e_cores+=("$cpu") ;;
+            *) other_cores+=("$cpu") ;;
+        esac
     done
 
+    tui_echo ""
+    tui_echo "${C_DIM}P-cores:${C_RESET} ${p_cores[*]}"
+    tui_echo "${C_DIM}E-cores:${C_RESET} ${e_cores[*]}"
+    tui_echo "${C_DIM}Other:${C_RESET} ${other_cores[*]}"
     tui_echo ""
     tui_echo "${C_DIM}Enter core numbers to toggle (e.g. 8-11 or 0,2,4,6).${C_RESET}"
     tui_echo "${C_DIM}Leave empty to go back.${C_RESET}"
@@ -724,7 +821,11 @@ tui_cores() {
 
         local new_online
         new_online=$(cat /sys/devices/system/cpu/online 2>/dev/null)
-        tui_ok "Toggled $toggled core(s). Online now: ${C_GREEN}${new_online}${C_RESET}"
+        if [[ $toggled -gt 0 ]]; then
+            tui_ok "Toggled $toggled core(s). Online now: ${C_GREEN}${new_online}${C_RESET}"
+        else
+            tui_err "No valid cores found in input."
+        fi
     fi
     tui_wait
 }
